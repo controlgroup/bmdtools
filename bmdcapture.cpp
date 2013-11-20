@@ -1,7 +1,7 @@
 /* -LICENSE-START-
 ** Copyright (c) 2009 Blackmagic Design
 ** Copyright (c) 2011 Luca Barbato
-**    with additions/fixes from Christian Hoffmann, 2012
+**	  with additions/fixes from Christian Hoffmann, 2012
 **
 ** Permission is hereby granted, free of charge, to any person or organization
 ** obtaining a copy of the software and accompanying documentation covered by
@@ -27,11 +27,14 @@
 ** -LICENSE-END-
 */
 
+#include <iostream>
+#include <sstream>
 #include <stdio.h>
 #include <stdlib.h>
 #include <pthread.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <ctime>
 
 #include "compat.h"
 #include "DeckLinkAPI.h"
@@ -51,27 +54,30 @@ IDeckLinkDisplayModeIterator *displayModeIterator;
 IDeckLinkDisplayMode *displayMode;
 IDeckLinkConfiguration *deckLinkConfiguration;
 
-static int g_videoModeIndex      = -1;
-static int g_audioChannels       = 2;
-static int g_audioSampleDepth    = 16;
-const char *g_videoOutputFile    = NULL;
-const char *g_audioOutputFile    = NULL;
-static int g_maxFrames           = -1;
-static int serial_fd             = -1;
-bool g_verbose                   = false;
-unsigned long long g_memoryLimit = 1024 * 1024 * 1024;            // 1GByte(>50 sec)
+static int g_videoModeIndex			 = -1;
+static int g_audioChannels			 = 2;
+static int g_audioSampleDepth		 = 16;
+static int g_time_interval			 = 0;
+const char *g_videoOutputFile		 = NULL;
+const char *g_audioOutputFile		 = NULL;
+const char *g_videoFrameOutputFile	 = NULL;
+static int g_maxFrames				 = -1;
+static int serial_fd				 = -1;
+bool g_verbose						 = false;
+unsigned long long g_memoryLimit	 = 1024 * 1024 * 1024;			  // 1GByte(>50 sec)
+static time_t g_last_frame_output;
 
 static unsigned long frameCount = 0;
-static unsigned int dropped     = 0, totaldropped = 0;
+static unsigned int dropped		= 0, totaldropped = 0;
 static enum PixelFormat pix_fmt = PIX_FMT_UYVY422;
 static enum AVSampleFormat sample_fmt = AV_SAMPLE_FMT_S16;
 typedef struct AVPacketQueue {
-    AVPacketList *first_pkt, *last_pkt;
-    int nb_packets;
-    unsigned long long size;
-    int abort_request;
-    pthread_mutex_t mutex;
-    pthread_cond_t cond;
+	AVPacketList *first_pkt, *last_pkt;
+	int nb_packets;
+	unsigned long long size;
+	int abort_request;
+	pthread_mutex_t mutex;
+	pthread_cond_t cond;
 } AVPacketQueue;
 
 static AVPacketQueue queue;
@@ -80,111 +86,111 @@ static AVPacket flush_pkt;
 
 static void avpacket_queue_init(AVPacketQueue *q)
 {
-    memset(q, 0, sizeof(AVPacketQueue));
-    pthread_mutex_init(&q->mutex, NULL);
-    pthread_cond_init(&q->cond, NULL);
+	memset(q, 0, sizeof(AVPacketQueue));
+	pthread_mutex_init(&q->mutex, NULL);
+	pthread_cond_init(&q->cond, NULL);
 }
 
 static void avpacket_queue_flush(AVPacketQueue *q)
 {
-    AVPacketList *pkt, *pkt1;
+	AVPacketList *pkt, *pkt1;
 
-    pthread_mutex_lock(&q->mutex);
-    for (pkt = q->first_pkt; pkt != NULL; pkt = pkt1) {
-        pkt1 = pkt->next;
-        av_free_packet(&pkt->pkt);
-        av_freep(&pkt);
-    }
-    q->last_pkt   = NULL;
-    q->first_pkt  = NULL;
-    q->nb_packets = 0;
-    q->size       = 0;
-    pthread_mutex_unlock(&q->mutex);
+	pthread_mutex_lock(&q->mutex);
+	for (pkt = q->first_pkt; pkt != NULL; pkt = pkt1) {
+		pkt1 = pkt->next;
+		av_free_packet(&pkt->pkt);
+		av_freep(&pkt);
+	}
+	q->last_pkt	  = NULL;
+	q->first_pkt  = NULL;
+	q->nb_packets = 0;
+	q->size		  = 0;
+	pthread_mutex_unlock(&q->mutex);
 }
 
 static void avpacket_queue_end(AVPacketQueue *q)
 {
-    avpacket_queue_flush(q);
-    pthread_mutex_destroy(&q->mutex);
-    pthread_cond_destroy(&q->cond);
+	avpacket_queue_flush(q);
+	pthread_mutex_destroy(&q->mutex);
+	pthread_cond_destroy(&q->cond);
 }
 
 static int avpacket_queue_put(AVPacketQueue *q, AVPacket *pkt)
 {
-    AVPacketList *pkt1;
+	AVPacketList *pkt1;
 
-    /* duplicate the packet */
-    if (pkt != &flush_pkt && av_dup_packet(pkt) < 0) {
-        return -1;
-    }
+	/* duplicate the packet */
+	if (pkt != &flush_pkt && av_dup_packet(pkt) < 0) {
+		return -1;
+	}
 
-    pkt1 = (AVPacketList *)av_malloc(sizeof(AVPacketList));
-    if (!pkt1) {
-        return -1;
-    }
-    pkt1->pkt  = *pkt;
-    pkt1->next = NULL;
+	pkt1 = (AVPacketList *)av_malloc(sizeof(AVPacketList));
+	if (!pkt1) {
+		return -1;
+	}
+	pkt1->pkt  = *pkt;
+	pkt1->next = NULL;
 
-    pthread_mutex_lock(&q->mutex);
+	pthread_mutex_lock(&q->mutex);
 
-    if (!q->last_pkt) {
-        q->first_pkt = pkt1;
-    } else {
-        q->last_pkt->next = pkt1;
-    }
+	if (!q->last_pkt) {
+		q->first_pkt = pkt1;
+	} else {
+		q->last_pkt->next = pkt1;
+	}
 
-    q->last_pkt = pkt1;
-    q->nb_packets++;
-    q->size += pkt1->pkt.size + sizeof(*pkt1);
+	q->last_pkt = pkt1;
+	q->nb_packets++;
+	q->size += pkt1->pkt.size + sizeof(*pkt1);
 
-    pthread_cond_signal(&q->cond);
+	pthread_cond_signal(&q->cond);
 
-    pthread_mutex_unlock(&q->mutex);
-    return 0;
+	pthread_mutex_unlock(&q->mutex);
+	return 0;
 }
 
 static int avpacket_queue_get(AVPacketQueue *q, AVPacket *pkt, int block)
 {
-    AVPacketList *pkt1;
-    int ret;
+	AVPacketList *pkt1;
+	int ret;
 
-    pthread_mutex_lock(&q->mutex);
+	pthread_mutex_lock(&q->mutex);
 
-    for (;; ) {
-        pkt1 = q->first_pkt;
-        if (pkt1) {
-            if (pkt1->pkt.data == flush_pkt.data) {
-                ret = 0;
-                break;
-            }
-            q->first_pkt = pkt1->next;
-            if (!q->first_pkt) {
-                q->last_pkt = NULL;
-            }
-            q->nb_packets--;
-            q->size -= pkt1->pkt.size + sizeof(*pkt1);
-            *pkt     = pkt1->pkt;
-            av_free(pkt1);
-            ret = 1;
-            break;
-        } else if (!block) {
-            ret = 0;
-            break;
-        } else {
-            pthread_cond_wait(&q->cond, &q->mutex);
-        }
-    }
-    pthread_mutex_unlock(&q->mutex);
-    return ret;
+	for (;; ) {
+		pkt1 = q->first_pkt;
+		if (pkt1) {
+			if (pkt1->pkt.data == flush_pkt.data) {
+				ret = 0;
+				break;
+			}
+			q->first_pkt = pkt1->next;
+			if (!q->first_pkt) {
+				q->last_pkt = NULL;
+			}
+			q->nb_packets--;
+			q->size -= pkt1->pkt.size + sizeof(*pkt1);
+			*pkt	 = pkt1->pkt;
+			av_free(pkt1);
+			ret = 1;
+			break;
+		} else if (!block) {
+			ret = 0;
+			break;
+		} else {
+			pthread_cond_wait(&q->cond, &q->mutex);
+		}
+	}
+	pthread_mutex_unlock(&q->mutex);
+	return ret;
 }
 
 static unsigned long long avpacket_queue_size(AVPacketQueue *q)
 {
-    unsigned long long size;
-    pthread_mutex_lock(&q->mutex);
-    size = q->size;
-    pthread_mutex_unlock(&q->mutex);
-    return size;
+	unsigned long long size;
+	pthread_mutex_lock(&q->mutex);
+	size = q->size;
+	pthread_mutex_unlock(&q->mutex);
+	return size;
 }
 
 AVOutputFormat *fmt = NULL;
@@ -194,163 +200,163 @@ BMDTimeValue frameRateDuration, frameRateScale;
 
 static AVStream *add_audio_stream(AVFormatContext *oc, enum AVCodecID codec_id)
 {
-    AVCodecContext *c;
-    AVCodec *codec;
-    AVStream *st;
+	AVCodecContext *c;
+	AVCodec *codec;
+	AVStream *st;
 
-    st = avformat_new_stream(oc, NULL);
-    if (!st) {
-        fprintf(stderr, "Could not alloc stream\n");
-        exit(1);
-    }
+	st = avformat_new_stream(oc, NULL);
+	if (!st) {
+		fprintf(stderr, "Could not alloc stream\n");
+		exit(1);
+	}
 
-    c             = st->codec;
-    c->codec_id   = codec_id;
-    c->codec_type = AVMEDIA_TYPE_AUDIO;
+	c			  = st->codec;
+	c->codec_id	  = codec_id;
+	c->codec_type = AVMEDIA_TYPE_AUDIO;
 
-    /* put sample parameters */
-    c->sample_fmt = sample_fmt;
-//    c->bit_rate = 64000;
-    c->sample_rate = 48000;
-    c->channels    = g_audioChannels;
-    // some formats want stream headers to be separate
-    if (oc->oformat->flags & AVFMT_GLOBALHEADER) {
-        c->flags |= CODEC_FLAG_GLOBAL_HEADER;
-    }
+	/* put sample parameters */
+	c->sample_fmt = sample_fmt;
+//	  c->bit_rate = 64000;
+	c->sample_rate = 48000;
+	c->channels	   = g_audioChannels;
+	// some formats want stream headers to be separate
+	if (oc->oformat->flags & AVFMT_GLOBALHEADER) {
+		c->flags |= CODEC_FLAG_GLOBAL_HEADER;
+	}
 
-    codec = avcodec_find_encoder(c->codec_id);
-    if (!codec) {
-        fprintf(stderr, "codec not found\n");
-        exit(1);
-    }
+	codec = avcodec_find_encoder(c->codec_id);
+	if (!codec) {
+		fprintf(stderr, "codec not found\n");
+		exit(1);
+	}
 
-    if (avcodec_open2(c, codec, NULL) < 0) {
-        fprintf(stderr, "could not open codec\n");
-        exit(1);
-    }
+	if (avcodec_open2(c, codec, NULL) < 0) {
+		fprintf(stderr, "could not open codec\n");
+		exit(1);
+	}
 
-    return st;
+	return st;
 }
 
 static AVStream *add_video_stream(AVFormatContext *oc, enum AVCodecID codec_id)
 {
-    AVCodecContext *c;
-    AVCodec *codec;
-    AVStream *st;
+	AVCodecContext *c;
+	AVCodec *codec;
+	AVStream *st;
 
-    st = avformat_new_stream(oc, NULL);
-    if (!st) {
-        fprintf(stderr, "Could not alloc stream\n");
-        exit(1);
-    }
+	st = avformat_new_stream(oc, NULL);
+	if (!st) {
+		fprintf(stderr, "Could not alloc stream\n");
+		exit(1);
+	}
 
-    c             = st->codec;
-    c->codec_id   = codec_id;
-    c->codec_type = AVMEDIA_TYPE_VIDEO;
+	c			  = st->codec;
+	c->codec_id	  = codec_id;
+	c->codec_type = AVMEDIA_TYPE_VIDEO;
 
-    /* put sample parameters */
-//    c->bit_rate = 400000;
-    /* resolution must be a multiple of two */
-    c->width  = displayMode->GetWidth();
-    c->height = displayMode->GetHeight();
-    /* time base: this is the fundamental unit of time (in seconds) in terms
-     * of which frame timestamps are represented. for fixed-fps content,
-     * timebase should be 1/framerate and timestamp increments should be
-     * identically 1.*/
-    displayMode->GetFrameRate(&frameRateDuration, &frameRateScale);
-    c->time_base.den = frameRateScale;
-    c->time_base.num = frameRateDuration;
-    c->pix_fmt       = pix_fmt;
+	/* put sample parameters */
+//	  c->bit_rate = 400000;
+	/* resolution must be a multiple of two */
+	c->width  = displayMode->GetWidth();
+	c->height = displayMode->GetHeight();
+	/* time base: this is the fundamental unit of time (in seconds) in terms
+	 * of which frame timestamps are represented. for fixed-fps content,
+	 * timebase should be 1/framerate and timestamp increments should be
+	 * identically 1.*/
+	displayMode->GetFrameRate(&frameRateDuration, &frameRateScale);
+	c->time_base.den = frameRateScale;
+	c->time_base.num = frameRateDuration;
+	c->pix_fmt		 = pix_fmt;
 
-    if (codec_id == AV_CODEC_ID_V210)
-        c->bits_per_raw_sample = 10;
-    // some formats want stream headers to be separate
-    if (oc->oformat->flags & AVFMT_GLOBALHEADER) {
-        c->flags |= CODEC_FLAG_GLOBAL_HEADER;
-    }
+	if (codec_id == AV_CODEC_ID_V210)
+		c->bits_per_raw_sample = 10;
+	// some formats want stream headers to be separate
+	if (oc->oformat->flags & AVFMT_GLOBALHEADER) {
+		c->flags |= CODEC_FLAG_GLOBAL_HEADER;
+	}
 
-    /* find the video encoder */
-    codec = avcodec_find_encoder(c->codec_id);
-    if (!codec) {
-        fprintf(stderr, "codec not found\n");
-        exit(1);
-    }
+	/* find the video encoder */
+	codec = avcodec_find_encoder(c->codec_id);
+	if (!codec) {
+		fprintf(stderr, "codec not found\n");
+		exit(1);
+	}
 
-    /* open the codec */
-    if (avcodec_open2(c, codec, NULL) < 0) {
-        fprintf(stderr, "could not open codec\n");
-        exit(1);
-    }
+	/* open the codec */
+	if (avcodec_open2(c, codec, NULL) < 0) {
+		fprintf(stderr, "could not open codec\n");
+		exit(1);
+	}
 
-    return st;
+	return st;
 }
 
 static AVStream *add_data_stream(AVFormatContext *oc, enum AVCodecID codec_id)
 {
-    AVCodec *codec;
-    AVCodecContext *c;
-    AVStream *st;
+	AVCodec *codec;
+	AVCodecContext *c;
+	AVStream *st;
 
-    st = avformat_new_stream(oc, NULL);
-    if (!st) {
-        fprintf(stderr, "Could not alloc stream\n");
-        exit(1);
-    }
+	st = avformat_new_stream(oc, NULL);
+	if (!st) {
+		fprintf(stderr, "Could not alloc stream\n");
+		exit(1);
+	}
 
-    c = st->codec;
-    c->codec_id = codec_id;
-    c->codec_type = AVMEDIA_TYPE_DATA;
+	c = st->codec;
+	c->codec_id = codec_id;
+	c->codec_type = AVMEDIA_TYPE_DATA;
 
-    displayMode->GetFrameRate(&frameRateDuration, &frameRateScale);
-    c->time_base.den = frameRateScale;
-    c->time_base.num = frameRateDuration;
+	displayMode->GetFrameRate(&frameRateDuration, &frameRateScale);
+	c->time_base.den = frameRateScale;
+	c->time_base.num = frameRateDuration;
 
-    // some formats want stream headers to be separate
-    if(oc->oformat->flags & AVFMT_GLOBALHEADER)
-        c->flags |= CODEC_FLAG_GLOBAL_HEADER;
+	// some formats want stream headers to be separate
+	if(oc->oformat->flags & AVFMT_GLOBALHEADER)
+		c->flags |= CODEC_FLAG_GLOBAL_HEADER;
 
-    /* find the video encoder */
-    codec = (AVCodec*)av_malloc(sizeof(AVCodec));
-    memset(codec, 0, sizeof(AVCodec));
-    codec->id = c->codec_id;
+	/* find the video encoder */
+	codec = (AVCodec*)av_malloc(sizeof(AVCodec));
+	memset(codec, 0, sizeof(AVCodec));
+	codec->id = c->codec_id;
 
-    /* open the codec */
-    c->codec = codec;
+	/* open the codec */
+	c->codec = codec;
 
-    return st;
+	return st;
 }
 
 DeckLinkCaptureDelegate::DeckLinkCaptureDelegate() : m_refCount(0)
 {
-    pthread_mutex_init(&m_mutex, NULL);
+	pthread_mutex_init(&m_mutex, NULL);
 }
 
 DeckLinkCaptureDelegate::~DeckLinkCaptureDelegate()
 {
-    pthread_mutex_destroy(&m_mutex);
+	pthread_mutex_destroy(&m_mutex);
 }
 
 ULONG DeckLinkCaptureDelegate::AddRef(void)
 {
-    pthread_mutex_lock(&m_mutex);
-    m_refCount++;
-    pthread_mutex_unlock(&m_mutex);
+	pthread_mutex_lock(&m_mutex);
+	m_refCount++;
+	pthread_mutex_unlock(&m_mutex);
 
-    return (ULONG)m_refCount;
+	return (ULONG)m_refCount;
 }
 
 ULONG DeckLinkCaptureDelegate::Release(void)
 {
-    pthread_mutex_lock(&m_mutex);
-    m_refCount--;
-    pthread_mutex_unlock(&m_mutex);
+	pthread_mutex_lock(&m_mutex);
+	m_refCount--;
+	pthread_mutex_unlock(&m_mutex);
 
-    if (m_refCount == 0) {
-        delete this;
-        return 0;
-    }
+	if (m_refCount == 0) {
+		delete this;
+		return 0;
+	}
 
-    return (ULONG)m_refCount;
+	return (ULONG)m_refCount;
 }
 
 int64_t initial_video_pts = AV_NOPTS_VALUE;
@@ -359,292 +365,306 @@ int64_t initial_audio_pts = AV_NOPTS_VALUE;
 static int no_video = 0;
 
 HRESULT DeckLinkCaptureDelegate::VideoInputFrameArrived(
-    IDeckLinkVideoInputFrame *videoFrame, IDeckLinkAudioInputPacket *audioFrame)
+	IDeckLinkVideoInputFrame *videoFrame, IDeckLinkAudioInputPacket *audioFrame)
 {
-    void *frameBytes;
-    void *audioFrameBytes;
-    BMDTimeValue frameTime;
-    BMDTimeValue frameDuration;
+	void *frameBytes;
+	void *audioFrameBytes;
+	BMDTimeValue frameTime;
+	BMDTimeValue frameDuration;
 
-    frameCount++;
+	frameCount++;
 
-    // Handle Video Frame
-    if (videoFrame) {
-        AVPacket pkt;
-        AVCodecContext *c;
-        av_init_packet(&pkt);
-        c = video_st->codec;
-        if (g_verbose && frameCount % 25 == 0) {
-            unsigned long long qsize = avpacket_queue_size(&queue);
-            fprintf(stderr,
-                    "Frame received (#%lu) - Valid (%liB) - QSize %f\n",
-                    frameCount,
-                    videoFrame->GetRowBytes() * videoFrame->GetHeight(),
-                    (double)qsize / 1024 / 1024);
-        }
+	// Handle Video Frame
+	if (videoFrame) {
+		AVPacket pkt;
+		AVCodecContext *c;
+		av_init_packet(&pkt);
+		c = video_st->codec;
+		if (g_verbose && frameCount % 25 == 0) {
+			unsigned long long qsize = avpacket_queue_size(&queue);
+			fprintf(stderr,
+					"Frame received (#%lu) - Valid (%liB) - QSize %f\n",
+					frameCount,
+					videoFrame->GetRowBytes() * videoFrame->GetHeight(),
+					(double)qsize / 1024 / 1024);
+		}
 
-        videoFrame->GetBytes(&frameBytes);
-        videoFrame->GetStreamTime(&frameTime, &frameDuration,
-                                  video_st->time_base.den);
+		videoFrame->GetBytes(&frameBytes);
+		videoFrame->GetStreamTime(&frameTime, &frameDuration,
+								  video_st->time_base.den);
 
-        if (videoFrame->GetFlags() & bmdFrameHasNoInputSource) {
-            unsigned bars[8] = {
-                0xEA80EA80, 0xD292D210, 0xA910A9A5, 0x90229035,
-                0x6ADD6ACA, 0x51EF515A, 0x286D28EF, 0x10801080 };
-            int width  = videoFrame->GetWidth();
-            int height = videoFrame->GetHeight();
-            unsigned *p = (unsigned *)frameBytes;
+		if (videoFrame->GetFlags() & bmdFrameHasNoInputSource) {
+			unsigned bars[8] = {
+				0xEA80EA80, 0xD292D210, 0xA910A9A5, 0x90229035,
+				0x6ADD6ACA, 0x51EF515A, 0x286D28EF, 0x10801080 };
+			int width  = videoFrame->GetWidth();
+			int height = videoFrame->GetHeight();
+			unsigned *p = (unsigned *)frameBytes;
 
-            for (int y = 0; y < height; y++) {
-                for (int x = 0; x < width; x += 2)
-                    *p++ = bars[(x * 8) / width];
-            }
+			for (int y = 0; y < height; y++) {
+				for (int x = 0; x < width; x += 2)
+					*p++ = bars[(x * 8) / width];
+			}
 
-            if (!no_video)
-                fprintf(stderr,
-                        "Frame received (#%lu) - No input signal detected "
-                        "- Frames dropped %u - Total dropped %u\n",
-                        frameCount, ++dropped, ++totaldropped);
-            no_video = 1;
-        } else {
-            if (no_video)
-                fprintf(stderr,
-                        "Frame received (#%lu) - Input returned "
-                        "- Frames dropped %u - Total dropped %u\n",
-                        frameCount, ++dropped, ++totaldropped);
-            no_video = 0;
-        }
+			if (!no_video)
+				fprintf(stderr,
+						"Frame received (#%lu) - No input signal detected "
+						"- Frames dropped %u - Total dropped %u\n",
+						frameCount, ++dropped, ++totaldropped);
+			no_video = 1;
+		} else {
+			if (no_video)
+				fprintf(stderr,
+						"Frame received (#%lu) - Input returned "
+						"- Frames dropped %u - Total dropped %u\n",
+						frameCount, ++dropped, ++totaldropped);
+			no_video = 0;
+		}
 
-        pkt.pts = frameTime / video_st->time_base.num;
+		pkt.pts = frameTime / video_st->time_base.num;
 
-        if (initial_video_pts == AV_NOPTS_VALUE) {
-            initial_video_pts = pkt.pts;
-        }
+		if (initial_video_pts == AV_NOPTS_VALUE) {
+			initial_video_pts = pkt.pts;
+		}
 
-        pkt.pts -= initial_video_pts;
-        pkt.dts = pkt.pts;
+		pkt.pts -= initial_video_pts;
+		pkt.dts = pkt.pts;
 
-        pkt.duration = frameDuration;
-        //To be made sure it still applies
-        pkt.flags       |= AV_PKT_FLAG_KEY;
-        pkt.stream_index = video_st->index;
-        pkt.data         = (uint8_t *)frameBytes;
-        pkt.size         = videoFrame->GetRowBytes() *
-                           videoFrame->GetHeight();
-        //fprintf(stderr,"Video Frame size %d ts %d\n", pkt.size, pkt.pts);
-        c->frame_number++;
-        avpacket_queue_put(&queue, &pkt);
+		pkt.duration = frameDuration;
+		//To be made sure it still applies
+		pkt.flags		|= AV_PKT_FLAG_KEY;
+		pkt.stream_index = video_st->index;
+		pkt.data		 = (uint8_t *)frameBytes;
+		pkt.size		 = videoFrame->GetRowBytes() *
+						   videoFrame->GetHeight();
+		//fprintf(stderr,"Video Frame size %d ts %d\n", pkt.size, pkt.pts);
+		c->frame_number++;
+		avpacket_queue_put(&queue, &pkt);
+	}
 
+	// Handle Audio Frame
+	if (audioFrame) {
+		AVCodecContext *c;
+		AVPacket pkt;
+		BMDTimeValue audio_pts;
+		av_init_packet(&pkt);
 
-    }
+		c = audio_st->codec;
+		//hack among hacks
+		pkt.size = audioFrame->GetSampleFrameCount() *
+				   g_audioChannels * (g_audioSampleDepth / 8);
+		audioFrame->GetBytes(&audioFrameBytes);
+		audioFrame->GetPacketTime(&audio_pts, audio_st->time_base.den);
+		pkt.pts = audio_pts / audio_st->time_base.num;
 
-    // Handle Audio Frame
-    if (audioFrame) {
-        AVCodecContext *c;
-        AVPacket pkt;
-        BMDTimeValue audio_pts;
-        av_init_packet(&pkt);
+		if (initial_audio_pts == AV_NOPTS_VALUE) {
+			initial_audio_pts = pkt.pts;
+		}
 
-        c = audio_st->codec;
-        //hack among hacks
-        pkt.size = audioFrame->GetSampleFrameCount() *
-                   g_audioChannels * (g_audioSampleDepth / 8);
-        audioFrame->GetBytes(&audioFrameBytes);
-        audioFrame->GetPacketTime(&audio_pts, audio_st->time_base.den);
-        pkt.pts = audio_pts / audio_st->time_base.num;
+		pkt.pts -= initial_audio_pts;
+		pkt.dts = pkt.pts;
 
-        if (initial_audio_pts == AV_NOPTS_VALUE) {
-            initial_audio_pts = pkt.pts;
-        }
+		//fprintf(stderr,"Audio Frame size %d ts %d\n", pkt.size, pkt.pts);
+		pkt.flags		|= AV_PKT_FLAG_KEY;
+		pkt.stream_index = audio_st->index;
+		pkt.data		 = (uint8_t *)audioFrameBytes;
+		//pkt.size= avcodec_encode_audio(c, audio_outbuf, audio_outbuf_size, samples);
+		c->frame_number++;
+		//write(audioOutputFile, audioFrameBytes, audioFrame->GetSampleFrameCount() * g_audioChannels * (g_audioSampleDepth / 8));
+/*			  if (av_interleaved_write_frame(oc, &pkt) != 0) {
+ *			fprintf(stderr, "Error while writing audio frame\n");
+ *			exit(1);
+ *		} */
+		avpacket_queue_put(&queue, &pkt);
+	}
 
-        pkt.pts -= initial_audio_pts;
-        pkt.dts = pkt.pts;
-
-        //fprintf(stderr,"Audio Frame size %d ts %d\n", pkt.size, pkt.pts);
-        pkt.flags       |= AV_PKT_FLAG_KEY;
-        pkt.stream_index = audio_st->index;
-        pkt.data         = (uint8_t *)audioFrameBytes;
-        //pkt.size= avcodec_encode_audio(c, audio_outbuf, audio_outbuf_size, samples);
-        c->frame_number++;
-        //write(audioOutputFile, audioFrameBytes, audioFrame->GetSampleFrameCount() * g_audioChannels * (g_audioSampleDepth / 8));
-/*            if (av_interleaved_write_frame(oc, &pkt) != 0) {
- *          fprintf(stderr, "Error while writing audio frame\n");
- *          exit(1);
- *      } */
-        avpacket_queue_put(&queue, &pkt);
-    }
-
-    if (serial_fd > 0) {
-        AVPacket pkt;
-        char line[8] = {0};
-        int count = read(serial_fd, line, 7);
-        if (count > 0)
-            fprintf(stderr, "read %d bytes: %s  \n", count, line);
+	if (serial_fd > 0) {
+		AVPacket pkt;
+		char line[8] = {0};
+		int count = read(serial_fd, line, 7);
+		if (count > 0)
+			fprintf(stderr, "read %d bytes: %s	\n", count, line);
 	else line[0] = ' ';
-        av_init_packet(&pkt);
-        pkt.flags |= AV_PKT_FLAG_KEY;
-        pkt.stream_index= data_st->index;
-        pkt.data = (uint8_t*)line;
-        pkt.size = 7;
-        pkt.pts = pkt.dts = frameTime/video_st->time_base.num;
-        avpacket_queue_put(&queue, &pkt);
-    }
+		av_init_packet(&pkt);
+		pkt.flags |= AV_PKT_FLAG_KEY;
+		pkt.stream_index= data_st->index;
+		pkt.data = (uint8_t*)line;
+		pkt.size = 7;
+		pkt.pts = pkt.dts = frameTime/video_st->time_base.num;
+		avpacket_queue_put(&queue, &pkt);
+	}
 
-    return S_OK;
+	return S_OK;
 }
 
 HRESULT DeckLinkCaptureDelegate::VideoInputFormatChanged(
-    BMDVideoInputFormatChangedEvents events, IDeckLinkDisplayMode *mode,
-    BMDDetectedVideoInputFormatFlags)
+	BMDVideoInputFormatChangedEvents events, IDeckLinkDisplayMode *mode,
+	BMDDetectedVideoInputFormatFlags)
 {
-    return S_OK;
+	return S_OK;
 }
 
 void print_output_modes(IDeckLink *deckLink)
 {
-    IDeckLinkOutput *deckLinkOutput                   = NULL;
-    IDeckLinkDisplayModeIterator *displayModeIterator = NULL;
-    IDeckLinkDisplayMode *displayMode                 = NULL;
-    HRESULT result;
-    int displayModeCount = 0;
+	IDeckLinkOutput *deckLinkOutput					  = NULL;
+	IDeckLinkDisplayModeIterator *displayModeIterator = NULL;
+	IDeckLinkDisplayMode *displayMode				  = NULL;
+	HRESULT result;
+	int displayModeCount = 0;
 
-    // Query the DeckLink for its configuration interface
-    result = deckLink->QueryInterface(IID_IDeckLinkOutput,
-                                      (void **)&deckLinkOutput);
-    if (result != S_OK) {
-        fprintf(
-            stderr,
-            "Could not obtain the IDeckLinkOutput interface - result = %08x\n",
-            result);
-        goto bail;
-    }
+	// Query the DeckLink for its configuration interface
+	result = deckLink->QueryInterface(IID_IDeckLinkOutput,
+									  (void **)&deckLinkOutput);
+	if (result != S_OK) {
+		fprintf(
+			stderr,
+			"Could not obtain the IDeckLinkOutput interface - result = %08x\n",
+			result);
+		goto bail;
+	}
 
-    // Obtain an IDeckLinkDisplayModeIterator to enumerate the display modes supported on output
-    result = deckLinkOutput->GetDisplayModeIterator(&displayModeIterator);
-    if (result != S_OK) {
-        fprintf(
-            stderr,
-            "Could not obtain the video output display mode iterator - result = %08x\n",
-            result);
-        goto bail;
-    }
+	// Obtain an IDeckLinkDisplayModeIterator to enumerate the display modes supported on output
+	result = deckLinkOutput->GetDisplayModeIterator(&displayModeIterator);
+	if (result != S_OK) {
+		fprintf(
+			stderr,
+			"Could not obtain the video output display mode iterator - result = %08x\n",
+			result);
+		goto bail;
+	}
 
-    // List all supported output display modes
-    printf("Supported video output display modes and pixel formats:\n");
-    while (displayModeIterator->Next(&displayMode) == S_OK) {
-        BMDProbeString str;
+	// List all supported output display modes
+	printf("Supported video output display modes and pixel formats:\n");
+	while (displayModeIterator->Next(&displayMode) == S_OK) {
+		BMDProbeString str;
 
-        result = displayMode->GetName(&str);
-        if (result == S_OK) {
-            char modeName[64];
-            int modeWidth;
-            int modeHeight;
-            BMDTimeValue frameRateDuration;
-            BMDTimeScale frameRateScale;
-            int pixelFormatIndex = 0;                     // index into the gKnownPixelFormats / gKnownFormatNames arrays
-            BMDDisplayModeSupport displayModeSupport;
-            // Obtain the display mode's properties
-            modeWidth  = displayMode->GetWidth();
-            modeHeight = displayMode->GetHeight();
-            displayMode->GetFrameRate(&frameRateDuration, &frameRateScale);
-            printf("        %2d:   %-20s \t %d x %d \t %7g FPS\n",
-                   displayModeCount++, ToStr(str), modeWidth, modeHeight,
-                   (double)frameRateScale / (double)frameRateDuration);
+		result = displayMode->GetName(&str);
+		if (result == S_OK) {
+			char modeName[64];
+			int modeWidth;
+			int modeHeight;
+			BMDTimeValue frameRateDuration;
+			BMDTimeScale frameRateScale;
+			int pixelFormatIndex = 0;					  // index into the gKnownPixelFormats / gKnownFormatNames arrays
+			BMDDisplayModeSupport displayModeSupport;
+			// Obtain the display mode's properties
+			modeWidth  = displayMode->GetWidth();
+			modeHeight = displayMode->GetHeight();
+			displayMode->GetFrameRate(&frameRateDuration, &frameRateScale);
+			printf("		%2d:   %-20s \t %d x %d \t %7g FPS\n",
+				   displayModeCount++, ToStr(str), modeWidth, modeHeight,
+				   (double)frameRateScale / (double)frameRateDuration);
 
-            FreeStr(str);
-        }
-        // Release the IDeckLinkDisplayMode object to prevent a leak
-        displayMode->Release();
-    }
+			FreeStr(str);
+		}
+		// Release the IDeckLinkDisplayMode object to prevent a leak
+		displayMode->Release();
+	}
 //	printf("\n");
 bail:
-    // Ensure that the interfaces we obtained are released to prevent a memory leak
-    if (displayModeIterator != NULL) {
-        displayModeIterator->Release();
-    }
-    if (deckLinkOutput != NULL) {
-        deckLinkOutput->Release();
-    }
+	// Ensure that the interfaces we obtained are released to prevent a memory leak
+	if (displayModeIterator != NULL) {
+		displayModeIterator->Release();
+	}
+	if (deckLinkOutput != NULL) {
+		deckLinkOutput->Release();
+	}
+}
+
+int write_file( const char* filename, const size_t size, const unsigned char* data )
+{
+	unsigned char* buffer = (unsigned char*) av_malloc( size );
+	AVIOContext* context = avio_alloc_context( buffer, size, 1, NULL, NULL, NULL, NULL );
+	if (avio_open(&context, filename, AVIO_FLAG_WRITE) < 0) {
+		fprintf(stderr, "Could not open '%s'\n", filename);
+		return 1;
+	}
+	else {
+		avio_write( context, data, size );
+		avio_close( context );
+	}
+	
+	return 0;
 }
 
 int usage(int status)
 {
-    HRESULT result;
-    IDeckLinkIterator *deckLinkIterator;
-    IDeckLink *deckLink;
-    int numDevices = 0;
-//  int                displayModeCount = 0;
+	HRESULT result;
+	IDeckLinkIterator *deckLinkIterator;
+	IDeckLink *deckLink;
+	int numDevices = 0;
+//	int				   displayModeCount = 0;
 
-    fprintf(stderr,
-            "Usage: bmdcapture -m <mode id> [OPTIONS]\n"
-            "\n"
-            "    -m <mode id>:\n"
-            );
+	fprintf(stderr,
+			"Usage: bmdcapture -m <mode id> [OPTIONS]\n"
+			"\n"
+			"	 -m <mode id>:\n"
+			);
 
-    // Create an IDeckLinkIterator object to enumerate all DeckLink cards in the system
-    deckLinkIterator = CreateDeckLinkIteratorInstance();
-    if (deckLinkIterator == NULL) {
-        fprintf(
-            stderr,
-            "A DeckLink iterator could not be created.  The DeckLink drivers may not be installed.\n");
-        return 1;
-    }
+	// Create an IDeckLinkIterator object to enumerate all DeckLink cards in the system
+	deckLinkIterator = CreateDeckLinkIteratorInstance();
+	if (deckLinkIterator == NULL) {
+		fprintf(
+			stderr,
+			"A DeckLink iterator could not be created.	The DeckLink drivers may not be installed.\n");
+		return 1;
+	}
 
-    // Enumerate all cards in this system
-    while (deckLinkIterator->Next(&deckLink) == S_OK) {
-        BMDProbeString str;
-        // Increment the total number of DeckLink cards found
-        numDevices++;
-        if (numDevices > 1) {
-            printf("\n\n");
-        }
+	// Enumerate all cards in this system
+	while (deckLinkIterator->Next(&deckLink) == S_OK) {
+		BMDProbeString str;
+		// Increment the total number of DeckLink cards found
+		numDevices++;
+		if (numDevices > 1) {
+			printf("\n\n");
+		}
 
-        // *** Print the model name of the DeckLink card
-        result = deckLink->GetModelName(&str);
-        if (result == S_OK) {
-            printf("-> %s (-C %d )\n\n",
-                   ToStr(str),
-                   numDevices - 1);
-            FreeStr(str);
-        }
+		// *** Print the model name of the DeckLink card
+		result = deckLink->GetModelName(&str);
+		if (result == S_OK) {
+			printf("-> %s (-C %d )\n\n",
+				   ToStr(str),
+				   numDevices - 1);
+			FreeStr(str);
+		}
 
-        print_output_modes(deckLink);
-        // Release the IDeckLink instance when we've finished with it to prevent leaks
-        deckLink->Release();
-    }
-    deckLinkIterator->Release();
+		print_output_modes(deckLink);
+		// Release the IDeckLink instance when we've finished with it to prevent leaks
+		deckLink->Release();
+	}
+	deckLinkIterator->Release();
 
-    // If no DeckLink cards were found in the system, inform the user
-    if (numDevices == 0) {
-        printf("No Blackmagic Design devices were found.\n");
-    }
-    printf("\n");
+	// If no DeckLink cards were found in the system, inform the user
+	if (numDevices == 0) {
+		printf("No Blackmagic Design devices were found.\n");
+	}
+	printf("\n");
 
 /*
- *  if (displayModeIterator)
- *  {
- *      // we try to print out some useful information about the chosen
- *      // card, but this only works if a card has been selected successfully
+ *	if (displayModeIterator)
+ *	{
+ *		// we try to print out some useful information about the chosen
+ *		// card, but this only works if a card has been selected successfully
  *
- *      while (displayModeIterator->Next(&displayMode) == S_OK)
- *      {
- *          char *          displayModeString = NULL;
+ *		while (displayModeIterator->Next(&displayMode) == S_OK)
+ *		{
+ *			char *			displayModeString = NULL;
  *
- *          result = displayMode->GetName((const char **) &displayModeString);
- *          if (result == S_OK)
- *          {
- *              BMDTimeValue frameRateDuration, frameRateScale;
- *              displayMode->GetFrameRate(&frameRateDuration, &frameRateScale);
- *              fprintf(stderr, "        %2d:  %-20s \t %li x %li \t %g FPS\n",
- *                  displayModeCount, displayModeString, displayMode->GetWidth(), displayMode->GetHeight(), (double)frameRateScale / (double)frameRateDuration);
- *              free(displayModeString);
- *              displayModeCount++;
- *          }
+ *			result = displayMode->GetName((const char **) &displayModeString);
+ *			if (result == S_OK)
+ *			{
+ *				BMDTimeValue frameRateDuration, frameRateScale;
+ *				displayMode->GetFrameRate(&frameRateDuration, &frameRateScale);
+ *				fprintf(stderr, "		 %2d:  %-20s \t %li x %li \t %g FPS\n",
+ *					displayModeCount, displayModeString, displayMode->GetWidth(), displayMode->GetHeight(), (double)frameRateScale / (double)frameRateDuration);
+ *				free(displayModeString);
+ *				displayModeCount++;
+ *			}
  *
- *          // Release the IDeckLinkDisplayMode object to prevent a leak
- *          displayMode->Release();
- *      }
- *  }
+ *			// Release the IDeckLinkDisplayMode object to prevent a leak
+ *			displayMode->Release();
+ *		}
+ *	}
  */
     fprintf(
         stderr,
@@ -658,6 +678,8 @@ int usage(int status)
         "    -M <memlimit>        Maximum queue size in GB (default is 1 GB)\n"
         "    -C <num>             number of card to be used\n"
         "    -S <serial_device>   data input serial\n"
+        "    -o <filename>        Filename for periodically saved image (ignored if -t is not used)\n"
+        "    -t <seconds>         Interval (in seconds) in which image output will be saved to disk\n"
         "    -A <audio-in>        Audio input:\n"
         "                         1: Analog (RCA or XLR)\n"
         "                         2: Embedded Audio (HDMI/SDI)\n"
@@ -677,340 +699,369 @@ int usage(int status)
     exit(status);
 }
 
+static int DEBUG_frame_count = 0;
+
 static void *push_packet(void *ctx)
 {
-    AVFormatContext *s = (AVFormatContext *)ctx;
-    AVPacket pkt;
-    int ret;
+	AVFormatContext *s = (AVFormatContext *)ctx;
+	AVPacket pkt;
+	int ret;
 
-    while (avpacket_queue_get(&queue, &pkt, 1)) {
-        av_interleaved_write_frame(s, &pkt);
-        if (g_maxFrames > 0 && frameCount >= g_maxFrames ||
-            avpacket_queue_size(&queue) > g_memoryLimit) {
-            pthread_cond_signal(&sleepCond);
-        }
-    }
+	while (avpacket_queue_get(&queue, &pkt, 1)) {
+		av_interleaved_write_frame(s, &pkt);
+		if (g_maxFrames > 0 && frameCount >= g_maxFrames ||
+			avpacket_queue_size(&queue) > g_memoryLimit) {
+			pthread_cond_signal(&sleepCond);
+		}
+		
+		if (g_time_interval > 0) {
+			time_t past;
+			time_t now = time(NULL);
+			struct tm now_tm = *localtime( &now );
+			struct tm past_tm = *localtime( &g_last_frame_output );
+			past_tm.tm_sec += g_time_interval;
+			past = mktime( &past_tm );
+			const double diff_seconds = difftime(now, past);
+			if ( diff_seconds > 0 ) {
+				g_last_frame_output = now;
+			
+				// ouptut next frame...
+				write_file( g_videoFrameOutputFile, (const size_t) pkt.size, (const unsigned char*) pkt.data );
+			}
+		}
+	}
 
-    return NULL;
+	return NULL;
 }
 
 int main(int argc, char *argv[])
 {
-    IDeckLinkIterator *deckLinkIterator = CreateDeckLinkIteratorInstance();
-    DeckLinkCaptureDelegate *delegate;
-    BMDDisplayMode selectedDisplayMode = bmdModeNTSC;
-    int displayModeCount               = 0;
-    int exitStatus                     = 1;
-    int aconnection                    = 0, vconnection = 0, camera = 0, i = 0;
-    int ch;
-    BMDPixelFormat pix = bmdFormat8BitYUV;
-    HRESULT result;
-    pthread_t th;
+	IDeckLinkIterator *deckLinkIterator = CreateDeckLinkIteratorInstance();
+	DeckLinkCaptureDelegate *delegate;
+	BMDDisplayMode selectedDisplayMode	= bmdModeNTSC;
+	int displayModeCount				= 0;
+	int exitStatus						= 1;
+	int aconnection						= 0, vconnection = 0, camera = 0, i = 0;
+	int ch;
+	BMDPixelFormat pix = bmdFormat8BitYUV;
+	HRESULT result;
+	pthread_t th;
 
-    pthread_mutex_init(&sleepMutex, NULL);
-    pthread_cond_init(&sleepCond, NULL);
-    av_register_all();
+	pthread_mutex_init(&sleepMutex, NULL);
+	pthread_cond_init(&sleepCond, NULL);
+	av_register_all();
 
-    if (!deckLinkIterator) {
-        fprintf(stderr,
-                "This application requires the DeckLink drivers installed.\n");
-        goto bail;
-    }
+	if (!deckLinkIterator) {
+		fprintf(stderr,
+				"This application requires the DeckLink drivers installed.\n");
+		goto bail;
+	}
 
-    // Parse command line options
-    while ((ch = getopt(argc, argv, "?hvc:s:f:a:m:n:p:M:F:C:A:V:")) != -1) {
-        switch (ch) {
-        case 'v':
-            g_verbose = true;
-            break;
-        case 'm':
-            g_videoModeIndex = atoi(optarg);
-            break;
-        case 'c':
-            g_audioChannels = atoi(optarg);
-            if (g_audioChannels != 2 &&
-                g_audioChannels != 8 &&
-                g_audioChannels != 16) {
-                fprintf(
-                    stderr,
-                    "Invalid argument: Audio Channels must be either 2, 8 or 16\n");
-                goto bail;
-            }
-            break;
-        case 's':
-            g_audioSampleDepth = atoi(optarg);
-            switch (g_audioSampleDepth) {
-            case 16:
-                sample_fmt = AV_SAMPLE_FMT_S16;
-                break;
-            case 32:
-                sample_fmt = AV_SAMPLE_FMT_S32;
-                break;
-            default:
-                fprintf(stderr,
-                        "Invalid argument:"
-                        " Audio Sample Depth must be either 16 bits"
-                        " or 32 bits\n");
-                goto bail;
-            }
-            break;
-        case 'p':
-            switch (atoi(optarg)) {
-            case  8:
-                pix     = bmdFormat8BitYUV;
-                pix_fmt = PIX_FMT_UYVY422;
-                break;
-            case 10:
-                pix     = bmdFormat10BitYUV;
-                pix_fmt = PIX_FMT_YUV422P10;
-                break;
-            default:
-                fprintf(
-                    stderr,
-                    "Invalid argument: Pixel Format Depth must be either 8 bits or 10 bits\n");
-                goto bail;
-            }
-            break;
-        case 'f':
-            g_videoOutputFile = optarg;
-            break;
-        case 'n':
-            g_maxFrames = atoi(optarg);
-            break;
-        case 'M':
-            g_memoryLimit = atoi(optarg) * 1024 * 1024 * 1024L;
-            break;
-        case 'F':
-            fmt = av_guess_format(optarg, NULL, NULL);
-            break;
-        case 'A':
-            aconnection = atoi(optarg);
-            break;
-        case 'V':
-            vconnection = atoi(optarg);
-            break;
-        case 'C':
-            camera = atoi(optarg);
-            break;
-        case 'S':
-            serial_fd = open(optarg, O_RDWR | O_NONBLOCK);
-            break;
-        case '?':
-        case 'h':
-            usage(0);
-        }
-    }
+	// Parse command line options
+	while ((ch = getopt(argc, argv, "?hvc:s:f:a:m:n:o:p:t:M:F:C:A:V:")) != -1) {
+		switch (ch) {
+		case 'v':
+			g_verbose = true;
+			break;
+		case 'm':
+			g_videoModeIndex = atoi(optarg);
+			break;
+		case 'c':
+			g_audioChannels = atoi(optarg);
+			if (g_audioChannels != 2 &&
+				g_audioChannels != 8 &&
+				g_audioChannels != 16) {
+				fprintf(
+					stderr,
+					"Invalid argument: Audio Channels must be either 2, 8 or 16\n");
+				goto bail;
+			}
+			break;
+		case 's':
+			g_audioSampleDepth = atoi(optarg);
+			switch (g_audioSampleDepth) {
+			case 16:
+				sample_fmt = AV_SAMPLE_FMT_S16;
+				break;
+			case 32:
+				sample_fmt = AV_SAMPLE_FMT_S32;
+				break;
+			default:
+				fprintf(stderr,
+						"Invalid argument:"
+						" Audio Sample Depth must be either 16 bits"
+						" or 32 bits\n");
+				goto bail;
+			}
+			break;
+		case 'p':
+			switch (atoi(optarg)) {
+			case  8:
+				pix		= bmdFormat8BitYUV;
+				pix_fmt = PIX_FMT_UYVY422;
+				break;
+			case 10:
+				pix		= bmdFormat10BitYUV;
+				pix_fmt = PIX_FMT_YUV422P10;
+				break;
+			default:
+				fprintf(
+					stderr,
+					"Invalid argument: Pixel Format Depth must be either 8 bits or 10 bits\n");
+				goto bail;
+			}
+			break;
+		case 'f':
+			g_videoOutputFile = optarg;
+			break;
+		case 'n':
+			g_maxFrames = atoi(optarg);
+			break;
+		case 'M':
+			g_memoryLimit = atoi(optarg) * 1024 * 1024 * 1024L;
+			break;
+		case 'F':
+			fmt = av_guess_format(optarg, NULL, NULL);
+			break;
+		case 'A':
+			aconnection = atoi(optarg);
+			break;
+		case 'V':
+			vconnection = atoi(optarg);
+			break;
+		case 'C':
+			camera = atoi(optarg);
+			break;
+		case 'S':
+			serial_fd = open(optarg, O_RDWR | O_NONBLOCK);
+			break;
+		case 'o':
+			g_videoFrameOutputFile = optarg;
+			break;
+		case 't':
+			g_time_interval = atoi(optarg);
+			break;
+		case '?':
+		case 'h':
+			usage(0);
+		}
+	}
+	
+	// validate timing input
+	if (g_time_interval < 0) {
+		g_time_interval = 0;
+	}
+	
+	g_last_frame_output = time(NULL); // set the starting time...
 
-    /* Connect to the first DeckLink instance */
-    do
-        result = deckLinkIterator->Next(&deckLink);
-    while (i++ < camera);
+	/* Connect to the first DeckLink instance */
+	do
+		result = deckLinkIterator->Next(&deckLink);
+	while (i++ < camera);
 
-    if (result != S_OK) {
-        fprintf(stderr, "No DeckLink PCI cards found.\n");
-        goto bail;
-    }
+	if (result != S_OK) {
+		fprintf(stderr, "No DeckLink PCI cards found.\n");
+		goto bail;
+	}
 
-    if (deckLink->QueryInterface(IID_IDeckLinkInput,
-                                 (void **)&deckLinkInput) != S_OK) {
-        goto bail;
-    }
+	if (deckLink->QueryInterface(IID_IDeckLinkInput,
+								 (void **)&deckLinkInput) != S_OK) {
+		goto bail;
+	}
 
-    result = deckLink->QueryInterface(IID_IDeckLinkConfiguration,
-                                      (void **)&deckLinkConfiguration);
-    if (result != S_OK) {
-        fprintf(
-            stderr,
-            "Could not obtain the IDeckLinkConfiguration interface - result = %08x\n",
-            result);
-        goto bail;
-    }
+	result = deckLink->QueryInterface(IID_IDeckLinkConfiguration,
+									  (void **)&deckLinkConfiguration);
+	if (result != S_OK) {
+		fprintf(
+			stderr,
+			"Could not obtain the IDeckLinkConfiguration interface - result = %08x\n",
+			result);
+		goto bail;
+	}
 
-    result = S_OK;
-    switch (aconnection) {
-    case 1:
-        result = DECKLINK_SET_AUDIO_CONNECTION(bmdAudioConnectionAnalog);
-        break;
-    case 2:
-        result = DECKLINK_SET_AUDIO_CONNECTION(bmdAudioConnectionEmbedded);
-        break;
-    case 3:
-        result = DECKLINK_SET_AUDIO_CONNECTION(bmdAudioConnectionAESEBU);
-        break;
-    default:
-        // do not change it
-        break;
-    }
-    if (result != S_OK) {
-        fprintf(stderr, "Failed to set audio input - result = %08x\n", result);
-        goto bail;
-    }
+	result = S_OK;
+	switch (aconnection) {
+	case 1:
+		result = DECKLINK_SET_AUDIO_CONNECTION(bmdAudioConnectionAnalog);
+		break;
+	case 2:
+		result = DECKLINK_SET_AUDIO_CONNECTION(bmdAudioConnectionEmbedded);
+		break;
+	case 3:
+		result = DECKLINK_SET_AUDIO_CONNECTION(bmdAudioConnectionAESEBU);
+		break;
+	default:
+		// do not change it
+		break;
+	}
+	if (result != S_OK) {
+		fprintf(stderr, "Failed to set audio input - result = %08x\n", result);
+		goto bail;
+	}
 
-    result = S_OK;
-    switch (vconnection) {
-    case 1:
-        result = DECKLINK_SET_VIDEO_CONNECTION(bmdVideoConnectionComposite);
-        break;
-    case 2:
-        result = DECKLINK_SET_VIDEO_CONNECTION(bmdVideoConnectionComponent);
-        break;
-    case 3:
-        result = DECKLINK_SET_VIDEO_CONNECTION(bmdVideoConnectionHDMI);
-        break;
-    case 4:
-        result = DECKLINK_SET_VIDEO_CONNECTION(bmdVideoConnectionSDI);
-        break;
-    case 5:
-        result = DECKLINK_SET_VIDEO_CONNECTION(bmdVideoConnectionOpticalSDI);
-        break;
-    case 6:
-        result = DECKLINK_SET_VIDEO_CONNECTION(bmdVideoConnectionSVideo);
-        break;
-    default:
-        // do not change it
-        break;
-    }
-    if (result != S_OK) {
-        fprintf(stderr, "Failed to set video input - result %08x\n", result);
-        goto bail;
-    }
+	result = S_OK;
+	switch (vconnection) {
+	case 1:
+		result = DECKLINK_SET_VIDEO_CONNECTION(bmdVideoConnectionComposite);
+		break;
+	case 2:
+		result = DECKLINK_SET_VIDEO_CONNECTION(bmdVideoConnectionComponent);
+		break;
+	case 3:
+		result = DECKLINK_SET_VIDEO_CONNECTION(bmdVideoConnectionHDMI);
+		break;
+	case 4:
+		result = DECKLINK_SET_VIDEO_CONNECTION(bmdVideoConnectionSDI);
+		break;
+	case 5:
+		result = DECKLINK_SET_VIDEO_CONNECTION(bmdVideoConnectionOpticalSDI);
+		break;
+	case 6:
+		result = DECKLINK_SET_VIDEO_CONNECTION(bmdVideoConnectionSVideo);
+		break;
+	default:
+		// do not change it
+		break;
+	}
+	if (result != S_OK) {
+		fprintf(stderr, "Failed to set video input - result %08x\n", result);
+		goto bail;
+	}
 
-    delegate = new DeckLinkCaptureDelegate();
-    deckLinkInput->SetCallback(delegate);
+	delegate = new DeckLinkCaptureDelegate();
+	deckLinkInput->SetCallback(delegate);
 
-    // Obtain an IDeckLinkDisplayModeIterator to enumerate the display modes supported on output
-    result = deckLinkInput->GetDisplayModeIterator(&displayModeIterator);
-    if (result != S_OK) {
-        fprintf(
-            stderr,
-            "Could not obtain the video output display mode iterator - result = %08x\n",
-            result);
-        goto bail;
-    }
+	// Obtain an IDeckLinkDisplayModeIterator to enumerate the display modes supported on output
+	result = deckLinkInput->GetDisplayModeIterator(&displayModeIterator);
+	if (result != S_OK) {
+		fprintf(
+			stderr,
+			"Could not obtain the video output display mode iterator - result = %08x\n",
+			result);
+		goto bail;
+	}
 
-    if (!g_videoOutputFile) {
-        fprintf(stderr,
-                "Missing argument: Please specify output path using -f\n");
-        goto bail;
-    }
+	if (!g_videoOutputFile) {
+		fprintf(stderr,
+				"Missing argument: Please specify output path using -f\n");
+		goto bail;
+	}
 
-    if (!fmt) {
-        fmt = av_guess_format(NULL, g_videoOutputFile, NULL);
-        if (!fmt) {
-            fprintf(
-                stderr,
-                "Unable to guess output format, please specify explicitly using -F\n");
-            goto bail;
-        }
-    }
+	if (!fmt) {
+		fmt = av_guess_format(NULL, g_videoOutputFile, NULL);
+		if (!fmt) {
+			fprintf(
+				stderr,
+				"Unable to guess output format, please specify explicitly using -F\n");
+			goto bail;
+		}
+	}
 
-    if (g_videoModeIndex < 0) {
-        fprintf(stderr, "No video mode specified\n");
-        usage(0);
-    }
+	if (g_videoModeIndex < 0) {
+		fprintf(stderr, "No video mode specified\n");
+		usage(0);
+	}
 
-    selectedDisplayMode = -1;
-    while (displayModeIterator->Next(&displayMode) == S_OK) {
-        if (g_videoModeIndex == displayModeCount) {
-            selectedDisplayMode = displayMode->GetDisplayMode();
-            break;
-        }
-        displayModeCount++;
-        displayMode->Release();
-    }
+	selectedDisplayMode = -1;
+	while (displayModeIterator->Next(&displayMode) == S_OK) {
+		if (g_videoModeIndex == displayModeCount) {
+			selectedDisplayMode = displayMode->GetDisplayMode();
+			break;
+		}
+		displayModeCount++;
+		displayMode->Release();
+	}
 
-    if (selectedDisplayMode < 0) {
-        fprintf(stderr, "Invalid mode %d specified\n", g_videoModeIndex);
-        goto bail;
-    }
+	if (selectedDisplayMode < 0) {
+		fprintf(stderr, "Invalid mode %d specified\n", g_videoModeIndex);
+		goto bail;
+	}
 
-    result = deckLinkInput->EnableVideoInput(selectedDisplayMode, pix, 0);
-    if (result != S_OK) {
-        fprintf(stderr,
-                "Failed to enable video input. Is another application using "
-                "the card?\n");
-        goto bail;
-    }
+	result = deckLinkInput->EnableVideoInput(selectedDisplayMode, pix, 0);
+	if (result != S_OK) {
+		fprintf(stderr,
+				"Failed to enable video input. Is another application using the card?\n");
+		goto bail;
+	}
 
-    result = deckLinkInput->EnableAudioInput(bmdAudioSampleRate48kHz,
-                                             g_audioSampleDepth,
-                                             g_audioChannels);
-    if (result != S_OK) {
-        fprintf(stderr,
-                "Failed to enable audio input. Is another application using "
-                "the card?\n");
-        goto bail;
-    }
+	result = deckLinkInput->EnableAudioInput(bmdAudioSampleRate48kHz,
+											 g_audioSampleDepth,
+											 g_audioChannels);
+	if (result != S_OK) {
+		fprintf(stderr,
+				"Failed to enable audio input. Is another application using the card?\n");
+		goto bail;
+	}
 
-    oc          = avformat_alloc_context();
-    oc->oformat = fmt;
+	oc			= avformat_alloc_context();
+	oc->oformat = fmt;
 
-    snprintf(oc->filename, sizeof(oc->filename), "%s", g_videoOutputFile);
+	snprintf(oc->filename, sizeof(oc->filename), "%s", g_videoOutputFile);
 
-    fmt->video_codec = (pix == bmdFormat8BitYUV ? AV_CODEC_ID_RAWVIDEO : AV_CODEC_ID_V210);
-    fmt->audio_codec = (sample_fmt == AV_SAMPLE_FMT_S16 ? AV_CODEC_ID_PCM_S16LE : AV_CODEC_ID_PCM_S32LE);
+	fmt->video_codec = (pix == bmdFormat8BitYUV ? AV_CODEC_ID_RAWVIDEO : AV_CODEC_ID_V210);
+	fmt->audio_codec = (sample_fmt == AV_SAMPLE_FMT_S16 ? AV_CODEC_ID_PCM_S16LE : AV_CODEC_ID_PCM_S32LE);
 
-    video_st = add_video_stream(oc, fmt->video_codec);
-    audio_st = add_audio_stream(oc, fmt->audio_codec);
+	video_st = add_video_stream(oc, fmt->video_codec);
+	audio_st = add_audio_stream(oc, fmt->audio_codec);
 
-    if (serial_fd > 0)
-        data_st = add_data_stream(oc, AV_CODEC_ID_TEXT);
+	if (serial_fd > 0)
+		data_st = add_data_stream(oc, AV_CODEC_ID_TEXT);
 
-    if (!(fmt->flags & AVFMT_NOFILE)) {
-        if (avio_open(&oc->pb, oc->filename, AVIO_FLAG_WRITE) < 0) {
-            fprintf(stderr, "Could not open '%s'\n", oc->filename);
-            exit(1);
-        }
-    }
+	if (!(fmt->flags & AVFMT_NOFILE)) {
+		if (avio_open(&oc->pb, oc->filename, AVIO_FLAG_WRITE) < 0) {
+			fprintf(stderr, "Could not open '%s'\n", oc->filename);
+			exit(1);
+		}
+	}
 
-    avformat_write_header(oc, NULL);
-    avpacket_queue_init(&queue);
+	avformat_write_header(oc, NULL);
+	avpacket_queue_init(&queue);
 
-    result = deckLinkInput->StartStreams();
-    if (result != S_OK) {
-        goto bail;
-    }
-    // All Okay.
-    exitStatus = 0;
+	result = deckLinkInput->StartStreams();
+	if (result != S_OK) {
+		goto bail;
+	}
+	// All Okay.
+	exitStatus = 0;
 
-    if (pthread_create(&th, NULL, push_packet, oc))
-        goto bail;
+	if (pthread_create(&th, NULL, push_packet, oc))
+		goto bail;
 
-    // Block main thread until signal occurs
-    pthread_mutex_lock(&sleepMutex);
-    pthread_cond_wait(&sleepCond, &sleepMutex);
-    pthread_mutex_unlock(&sleepMutex);
-    deckLinkInput->StopStreams();
-    fprintf(stderr, "Stopping Capture\n");
-    avpacket_queue_end(&queue);
+	// Block main thread until signal occurs
+	pthread_mutex_lock(&sleepMutex);
+	pthread_cond_wait(&sleepCond, &sleepMutex);
+	pthread_mutex_unlock(&sleepMutex);
+	deckLinkInput->StopStreams();
+	fprintf(stderr, "Stopping Capture\n");
+	avpacket_queue_end(&queue);
 
 bail:
-    if (displayModeIterator != NULL) {
-        displayModeIterator->Release();
-        displayModeIterator = NULL;
-    }
+	if (displayModeIterator != NULL) {
+		displayModeIterator->Release();
+		displayModeIterator = NULL;
+	}
 
-    if (deckLinkInput != NULL) {
-        deckLinkInput->Release();
-        deckLinkInput = NULL;
-    }
+	if (deckLinkInput != NULL) {
+		deckLinkInput->Release();
+		deckLinkInput = NULL;
+	}
 
-    if (deckLink != NULL) {
-        deckLink->Release();
-        deckLink = NULL;
-    }
+	if (deckLink != NULL) {
+		deckLink->Release();
+		deckLink = NULL;
+	}
 
-    if (deckLinkIterator != NULL) {
-        deckLinkIterator->Release();
-    }
+	if (deckLinkIterator != NULL) {
+		deckLinkIterator->Release();
+	}
 
-    if (oc != NULL) {
-        av_write_trailer(oc);
-        if (!(fmt->flags & AVFMT_NOFILE)) {
-            /* close the output file */
-            avio_close(oc->pb);
-        }
-    }
+	if (oc != NULL) {
+		av_write_trailer(oc);
+		if (!(fmt->flags & AVFMT_NOFILE)) {
+			/* close the output file */
+			avio_close(oc->pb);
+		}
+	}
 
-    return exitStatus;
+	return exitStatus;
 }
