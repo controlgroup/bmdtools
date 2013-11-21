@@ -76,7 +76,7 @@ typedef struct frame_buffer_t {
 
 FrameData g_frame = { 0, 0, false };
 
-static unsigned long frameCount = 0;
+static unsigned long long frameCount = 0;
 static unsigned int dropped		= 0, totaldropped = 0;
 static enum PixelFormat pix_fmt = PIX_FMT_UYVY422;
 static enum AVSampleFormat sample_fmt = AV_SAMPLE_FMT_S16;
@@ -392,7 +392,7 @@ HRESULT DeckLinkCaptureDelegate::VideoInputFrameArrived(
 		if (g_verbose && frameCount % 25 == 0) {
 			unsigned long long qsize = avpacket_queue_size(&read_queue);
 			fprintf(stderr,
-					"Frame received (#%lu) - Valid (%liB) - QSize %f\n",
+					"Frame received (#%llu) - Valid (%liB) - QSize %f\n",
 					frameCount,
 					videoFrame->GetRowBytes() * videoFrame->GetHeight(),
 					(double)qsize / 1024 / 1024);
@@ -417,27 +417,27 @@ HRESULT DeckLinkCaptureDelegate::VideoInputFrameArrived(
 
 			if (!no_video) {
 				fprintf(stderr,
-						"Frame received (#%lu) - No input signal detected "
+						"Frame received (#%llu) - No input signal detected "
 						"- Frames dropped %u - Total dropped %u\n",
 						frameCount, ++dropped, ++totaldropped);
 				no_video = 1;
 			}
 			else if (frameCount % 60 == 0) {
 				fprintf(stderr,
-						"Frame received (#%lu) - No input signal detected "
+						"Frame received (#%llu) - No input signal detected "
 						"- Frames dropped %u - Total dropped %u\n",
 						frameCount, ++dropped, ++totaldropped);
 			}
 		} else {
 			if (no_video) {
 				fprintf(stderr,
-						"Frame received (#%lu) - Input returned "
+						"Frame received (#%llu) - Input returned "
 						"- Frames dropped %u - Total dropped %u\n",
 						frameCount, ++dropped, ++totaldropped);
 				no_video = 0;
 			}
 			else if (frameCount % 60 == 0) {
-				fprintf(stderr, "Frame received (#%lu) - Input received\n", frameCount);
+				fprintf(stderr, "Frame received (#%llu) - Input received\n", frameCount);
 			}
 		}
 
@@ -908,6 +908,11 @@ int main(int argc, char *argv[])
 	}
 	
 	g_writingOutput = g_time_interval > 0;
+	if (g_writingOutput) {
+		if (NULL == g_videoFrameOutputFile) {
+			g_videoFrameOutputFile = "output.uyvy";
+		}
+	}
 	g_last_frame_output = time(NULL); // set the starting time...
 
 	/* Connect to the first DeckLink instance */
