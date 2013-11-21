@@ -91,7 +91,6 @@ typedef struct AVPacketQueue {
 } AVPacketQueue;
 
 static AVPacketQueue read_queue;
-// static AVPacketQueue write_queue;
 static AVPacket flush_pkt;
 
 static void avpacket_queue_init(AVPacketQueue *q)
@@ -736,11 +735,9 @@ int usage(int status)
 
 static void* write_output(void*)
 {
+	// check flag to see if program is exiting or not
 	while (g_writingOutput) {
-		// AVPacket pkt;
-		// if (avpacket_queue_size(&write_queue) > 0 && avpacket_queue_get(&write_queue, &pkt, 1)) {
-		// 	write_frame(g_videoFrameOutputFile, (const size_t) pkt.size, (const unsigned char*) pkt.data);
-		// }
+		// check latest frame to see if it was already written
 		if (g_frame.write) {
 			write_frame(g_videoFrameOutputFile, g_frame.size, g_frame.data);
 			free(g_frame.data);
@@ -749,7 +746,7 @@ static void* write_output(void*)
 			g_frame.write = false;
 		}	
 
-		sleep(1);
+		sleep(1);	// sleep so we don't hog all the resources
 	}
 }
 
@@ -770,13 +767,8 @@ static void* push_packet(void *ctx)
 			const double diff_seconds = difftime(now, past);
 			if ( diff_seconds > 0 ) {
 				g_last_frame_output = now;
-			
-				// ouptut next frame...
-				//write_file( g_videoFrameOutputFile, (const size_t) pkt.size, (const unsigned char*) pkt.data );
-				//av_interleaved_write_frame(savedOutputContext, &pkt);
-				//write_frame(g_videoFrameOutputFile, (const size_t) pkt.size, (const unsigned char*) pkt.data);
-				//copy_frame(g_videoFrameOutputFile, (const size_t) pkt.size, (const unsigned char*) pkt.data);
 				
+				// copy frame data to write to disk in separate thread
 				g_frame.size = pkt.size;
 				g_frame.data = (uint8_t*) malloc(g_frame.size);
 				memcpy(g_frame.data, pkt.data, pkt.size);
@@ -915,9 +907,7 @@ int main(int argc, char *argv[])
 		g_time_interval = 0;
 	}
 	
-	if (g_time_interval) {
-		g_writingOutput = g_time_interval > 0;
-	}
+	g_writingOutput = g_time_interval > 0;
 	g_last_frame_output = time(NULL); // set the starting time...
 
 	/* Connect to the first DeckLink instance */
@@ -1059,7 +1049,8 @@ int main(int argc, char *argv[])
 		goto bail;
 	}
 
-	oc			= avformat_alloc_context();
+	// allocating data for muxing
+	oc = avformat_alloc_context();
 	oc->oformat = fmt;
 
 	snprintf(oc->filename, sizeof(oc->filename), "%s", g_videoOutputFile);
@@ -1073,6 +1064,7 @@ int main(int argc, char *argv[])
 	if (serial_fd > 0)
 		data_st = add_data_stream(oc, AV_CODEC_ID_TEXT);
 
+	// open output
 	if (!(fmt->flags & AVFMT_NOFILE)) {
 		if (avio_open(&oc->pb, oc->filename, AVIO_FLAG_WRITE) < 0) {
 			fprintf(stderr, "Could not open '%s'\n", oc->filename);
@@ -1080,12 +1072,9 @@ int main(int argc, char *argv[])
 		}
 	}
 
+	// initialize FIFO queue
 	avformat_write_header(oc, NULL);
 	avpacket_queue_init(&read_queue);
-	
-	// if (g_time_interval > 0) {
-	// 	avpacket_queue_init(&write_queue);
-	// }
 
 	result = deckLinkInput->StartStreams();
 	if (result != S_OK) {
@@ -1094,11 +1083,15 @@ int main(int argc, char *argv[])
 	// All Okay.
 	exitStatus = 0;
 
+	// spawn thread for processing raw video frames
 	if (pthread_create(&video_processing_thread, NULL, push_packet, oc))
 		goto bail;
 
-	if (pthread_create(&output_write_thread, NULL, write_output, NULL))
-		goto bail;
+	// spawn thread for writing output to disk (if specified)
+	if (g_time_interval > 0) {
+		if (pthread_create(&output_write_thread, NULL, write_output, NULL))
+			goto bail;
+	}
 
 	// Block main thread until signal occurs
 	pthread_mutex_lock(&sleepMutex);
@@ -1110,7 +1103,6 @@ int main(int argc, char *argv[])
 	deckLinkInput->StopStreams();
 	fprintf(stderr, "Stopping Capture\n");
 	avpacket_queue_end(&read_queue);
-	//avpacket_queue_end(&write_queue);
 
 bail:
 	if (displayModeIterator != NULL) {
