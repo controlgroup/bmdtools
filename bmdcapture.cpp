@@ -594,8 +594,12 @@ int write_frame( const char* filename, const size_t size, const unsigned char* d
 	FILE* outputFilePtr = fopen( filename, "wb" );
 	if (outputFilePtr) {
 		fwrite(data, sizeof(char), size, outputFilePtr);
+		fclose(outputFilePtr);
+		return 0;
 	}
-	fclose(outputFilePtr);
+	else {
+		return -1;
+	}
 }
 
 int write_file( const char* filename, const size_t size, const unsigned char* data )
@@ -726,7 +730,7 @@ int usage(int status)
     exit(status);
 }
 
-static void* write_ouput(void*)
+static void* write_output(void*)
 {
 	while (g_writingOutput) {
 		// AVPacket pkt;
@@ -739,7 +743,9 @@ static void* write_ouput(void*)
 			g_frame.data = NULL;
 			g_frame.size = 0;
 			g_frame.write = false;
-		}
+		}	
+
+		sleep(1);
 	}
 }
 
@@ -1087,7 +1093,7 @@ int main(int argc, char *argv[])
 	if (pthread_create(&video_processing_thread, NULL, push_packet, oc))
 		goto bail;
 
-	if (pthread_create(&output_write_thread, NULL, write_ouput, NULL))
+	if (pthread_create(&output_write_thread, NULL, write_output, NULL))
 		goto bail;
 
 	// Block main thread until signal occurs
