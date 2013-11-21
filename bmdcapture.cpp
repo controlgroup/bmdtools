@@ -66,11 +66,21 @@ static int serial_fd				 = -1;
 bool g_verbose						 = false;
 unsigned long long g_memoryLimit	 = 1024 * 1024 * 1024;			  // 1GByte(>50 sec)
 static time_t g_last_frame_output;
+static bool g_writingOutput = false;
+
+typedef struct frame_buffer_t {
+	uint8_t* data;
+	size_t size;
+	bool write;
+} FrameData;
+
+FrameData g_frame = { 0, 0, false };
 
 static unsigned long frameCount = 0;
 static unsigned int dropped		= 0, totaldropped = 0;
 static enum PixelFormat pix_fmt = PIX_FMT_UYVY422;
 static enum AVSampleFormat sample_fmt = AV_SAMPLE_FMT_S16;
+
 typedef struct AVPacketQueue {
 	AVPacketList *first_pkt, *last_pkt;
 	int nb_packets;
@@ -80,8 +90,8 @@ typedef struct AVPacketQueue {
 	pthread_cond_t cond;
 } AVPacketQueue;
 
-static AVPacketQueue queue;
-
+static AVPacketQueue read_queue;
+// static AVPacketQueue write_queue;
 static AVPacket flush_pkt;
 
 static void avpacket_queue_init(AVPacketQueue *q)
@@ -381,7 +391,7 @@ HRESULT DeckLinkCaptureDelegate::VideoInputFrameArrived(
 		av_init_packet(&pkt);
 		c = video_st->codec;
 		if (g_verbose && frameCount % 25 == 0) {
-			unsigned long long qsize = avpacket_queue_size(&queue);
+			unsigned long long qsize = avpacket_queue_size(&read_queue);
 			fprintf(stderr,
 					"Frame received (#%lu) - Valid (%liB) - QSize %f\n",
 					frameCount,
@@ -406,12 +416,19 @@ HRESULT DeckLinkCaptureDelegate::VideoInputFrameArrived(
 					*p++ = bars[(x * 8) / width];
 			}
 
-			if (!no_video)
+			if (!no_video) {
 				fprintf(stderr,
 						"Frame received (#%lu) - No input signal detected "
 						"- Frames dropped %u - Total dropped %u\n",
 						frameCount, ++dropped, ++totaldropped);
-			no_video = 1;
+				no_video = 1;
+			}
+			else if (g_verbose && frameCount % 60 == 0) {
+				fprintf(stderr,
+						"Frame received (#%lu) - No input signal detected "
+						"- Frames dropped %u - Total dropped %u\n",
+						frameCount, ++dropped, ++totaldropped);
+			}
 		} else {
 			if (no_video)
 				fprintf(stderr,
@@ -437,9 +454,10 @@ HRESULT DeckLinkCaptureDelegate::VideoInputFrameArrived(
 		pkt.data		 = (uint8_t *)frameBytes;
 		pkt.size		 = videoFrame->GetRowBytes() *
 						   videoFrame->GetHeight();
+		
 		//fprintf(stderr,"Video Frame size %d ts %d\n", pkt.size, pkt.pts);
 		c->frame_number++;
-		avpacket_queue_put(&queue, &pkt);
+		avpacket_queue_put(&read_queue, &pkt);
 	}
 
 	// Handle Audio Frame
@@ -475,7 +493,7 @@ HRESULT DeckLinkCaptureDelegate::VideoInputFrameArrived(
  *			fprintf(stderr, "Error while writing audio frame\n");
  *			exit(1);
  *		} */
-		avpacket_queue_put(&queue, &pkt);
+		avpacket_queue_put(&read_queue, &pkt);
 	}
 
 	if (serial_fd > 0) {
@@ -491,7 +509,7 @@ HRESULT DeckLinkCaptureDelegate::VideoInputFrameArrived(
 		pkt.data = (uint8_t*)line;
 		pkt.size = 7;
 		pkt.pts = pkt.dts = frameTime/video_st->time_base.num;
-		avpacket_queue_put(&queue, &pkt);
+		avpacket_queue_put(&read_queue, &pkt);
 	}
 
 	return S_OK;
@@ -569,6 +587,15 @@ bail:
 	if (deckLinkOutput != NULL) {
 		deckLinkOutput->Release();
 	}
+}
+
+int write_frame( const char* filename, const size_t size, const unsigned char* data )
+{
+	FILE* outputFilePtr = fopen( filename, "wb" );
+	if (outputFilePtr) {
+		fwrite(data, sizeof(char), size, outputFilePtr);
+	}
+	fclose(outputFilePtr);
 }
 
 int write_file( const char* filename, const size_t size, const unsigned char* data )
@@ -699,22 +726,31 @@ int usage(int status)
     exit(status);
 }
 
-static int DEBUG_frame_count = 0;
+static void* write_ouput(void*)
+{
+	while (g_writingOutput) {
+		// AVPacket pkt;
+		// if (avpacket_queue_size(&write_queue) > 0 && avpacket_queue_get(&write_queue, &pkt, 1)) {
+		// 	write_frame(g_videoFrameOutputFile, (const size_t) pkt.size, (const unsigned char*) pkt.data);
+		// }
+		if (g_frame.write) {
+			write_frame(g_videoFrameOutputFile, g_frame.size, g_frame.data);
+			free(g_frame.data);
+			g_frame.data = NULL;
+			g_frame.size = 0;
+			g_frame.write = false;
+		}
+	}
+}
 
-static void *push_packet(void *ctx)
+static void* push_packet(void *ctx)
 {
 	AVFormatContext *s = (AVFormatContext *)ctx;
 	AVPacket pkt;
 	int ret;
 
-	while (avpacket_queue_get(&queue, &pkt, 1)) {
-		av_interleaved_write_frame(s, &pkt);
-		if (g_maxFrames > 0 && frameCount >= g_maxFrames ||
-			avpacket_queue_size(&queue) > g_memoryLimit) {
-			pthread_cond_signal(&sleepCond);
-		}
-		
-		if (g_time_interval > 0) {
+	while (avpacket_queue_get(&read_queue, &pkt, 1)) {
+		if (g_time_interval > 0 && video_st->index == pkt.stream_index) {
 			time_t past;
 			time_t now = time(NULL);
 			struct tm now_tm = *localtime( &now );
@@ -726,8 +762,22 @@ static void *push_packet(void *ctx)
 				g_last_frame_output = now;
 			
 				// ouptut next frame...
-				write_file( g_videoFrameOutputFile, (const size_t) pkt.size, (const unsigned char*) pkt.data );
+				//write_file( g_videoFrameOutputFile, (const size_t) pkt.size, (const unsigned char*) pkt.data );
+				//av_interleaved_write_frame(savedOutputContext, &pkt);
+				//write_frame(g_videoFrameOutputFile, (const size_t) pkt.size, (const unsigned char*) pkt.data);
+				//copy_frame(g_videoFrameOutputFile, (const size_t) pkt.size, (const unsigned char*) pkt.data);
+				
+				g_frame.size = pkt.size;
+				g_frame.data = (uint8_t*) malloc(g_frame.size);
+				memcpy(g_frame.data, pkt.data, pkt.size);
+				g_frame.write = true;
 			}
+		}
+		
+		av_interleaved_write_frame(s, &pkt);
+		if (g_maxFrames > 0 && frameCount >= g_maxFrames ||
+			avpacket_queue_size(&read_queue) > g_memoryLimit) {
+			pthread_cond_signal(&sleepCond);
 		}
 	}
 
@@ -745,10 +795,13 @@ int main(int argc, char *argv[])
 	int ch;
 	BMDPixelFormat pix = bmdFormat8BitYUV;
 	HRESULT result;
-	pthread_t th;
+	pthread_t video_processing_thread;
+	pthread_t output_write_thread;
 
 	pthread_mutex_init(&sleepMutex, NULL);
 	pthread_cond_init(&sleepCond, NULL);
+	//pthread_mutex_init(&copyMutex, NULL);
+	
 	av_register_all();
 
 	if (!deckLinkIterator) {
@@ -852,6 +905,9 @@ int main(int argc, char *argv[])
 		g_time_interval = 0;
 	}
 	
+	if (g_time_interval) {
+		g_writingOutput = g_time_interval > 0;
+	}
 	g_last_frame_output = time(NULL); // set the starting time...
 
 	/* Connect to the first DeckLink instance */
@@ -1000,7 +1056,7 @@ int main(int argc, char *argv[])
 
 	fmt->video_codec = (pix == bmdFormat8BitYUV ? AV_CODEC_ID_RAWVIDEO : AV_CODEC_ID_V210);
 	fmt->audio_codec = (sample_fmt == AV_SAMPLE_FMT_S16 ? AV_CODEC_ID_PCM_S16LE : AV_CODEC_ID_PCM_S32LE);
-
+	
 	video_st = add_video_stream(oc, fmt->video_codec);
 	audio_st = add_audio_stream(oc, fmt->audio_codec);
 
@@ -1015,7 +1071,11 @@ int main(int argc, char *argv[])
 	}
 
 	avformat_write_header(oc, NULL);
-	avpacket_queue_init(&queue);
+	avpacket_queue_init(&read_queue);
+	
+	// if (g_time_interval > 0) {
+	// 	avpacket_queue_init(&write_queue);
+	// }
 
 	result = deckLinkInput->StartStreams();
 	if (result != S_OK) {
@@ -1024,16 +1084,23 @@ int main(int argc, char *argv[])
 	// All Okay.
 	exitStatus = 0;
 
-	if (pthread_create(&th, NULL, push_packet, oc))
+	if (pthread_create(&video_processing_thread, NULL, push_packet, oc))
+		goto bail;
+
+	if (pthread_create(&output_write_thread, NULL, write_ouput, NULL))
 		goto bail;
 
 	// Block main thread until signal occurs
 	pthread_mutex_lock(&sleepMutex);
 	pthread_cond_wait(&sleepCond, &sleepMutex);
 	pthread_mutex_unlock(&sleepMutex);
+	g_writingOutput = false;
+	
+	// clean up...
 	deckLinkInput->StopStreams();
 	fprintf(stderr, "Stopping Capture\n");
-	avpacket_queue_end(&queue);
+	avpacket_queue_end(&read_queue);
+	//avpacket_queue_end(&write_queue);
 
 bail:
 	if (displayModeIterator != NULL) {
