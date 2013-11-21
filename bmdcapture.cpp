@@ -423,19 +423,23 @@ HRESULT DeckLinkCaptureDelegate::VideoInputFrameArrived(
 						frameCount, ++dropped, ++totaldropped);
 				no_video = 1;
 			}
-			else if (g_verbose && frameCount % 60 == 0) {
+			else if (frameCount % 60 == 0) {
 				fprintf(stderr,
 						"Frame received (#%lu) - No input signal detected "
 						"- Frames dropped %u - Total dropped %u\n",
 						frameCount, ++dropped, ++totaldropped);
 			}
 		} else {
-			if (no_video)
+			if (no_video) {
 				fprintf(stderr,
 						"Frame received (#%lu) - Input returned "
 						"- Frames dropped %u - Total dropped %u\n",
 						frameCount, ++dropped, ++totaldropped);
-			no_video = 0;
+				no_video = 0;
+			}
+			else if (frameCount % 60 == 0) {
+				fprintf(stderr, "Frame received (#%lu) - Input received\n", frameCount);
+			}
 		}
 
 		pkt.pts = frameTime / video_st->time_base.num;
